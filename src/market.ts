@@ -160,8 +160,8 @@ export function buildPair(sym: string, t: any, pi: any, ss: any | null): any {
   }
 }
 
-async function build(): Promise<any> {
-  // Bulk: price/change/volume (ticker) + funding (premiumIndex) for all symbols.
+// ---- Bulk layer: price/change/volume/funding for EVERY pair. Fast (2 calls). ----
+async function buildBulk(): Promise<{ tickers: Record<string, any>; tickMap: Map<string, any>; premMap: Map<string, any> }> {
   const [tickArr, premArr] = await Promise.all([
     fetchJson(BASE + '/fapi/v1/ticker/24hr'),
     fetchJson(BASE + '/fapi/v1/premiumIndex'),
@@ -183,7 +183,7 @@ async function build(): Promise<any> {
     const fund = pi ? num(pi.lastFundingRate) * 100 : NaN
     // Crowding + breakdown DERIVED FROM REAL bulk data (funding rate, 24h move,
     // quote volume) for EVERY pair - no simulation. The focused subset overrides
-    // these with richer positioning-based values further below.
+    // these with richer positioning-based values in the background pairs layer.
     const fAbs = isFinite(fund) ? Math.abs(fund) : 0
     const chAbs = isFinite(ch) ? Math.abs(ch) : 0
     const crowd = clampV(26 + c01(fAbs / 0.05) * 34 + c01(chAbs / 10) * 22)
@@ -203,47 +203,76 @@ async function build(): Promise<any> {
       crowd, align, exits, conc, agents, buyPct, longPct,
     }
   }
+  return { tickers, tickMap, premMap }
+}
 
-  // Heavy per-symbol metrics for the focused subset (positioning/flow/OI).
+// ---- Heavy layer: positioning/flow/OI for the focused subset. Slower (per-symbol). ----
+async function buildPairs(tickMap: Map<string, any>, premMap: Map<string, any>): Promise<Record<string, any>> {
   const syms = subset().filter((s) => tickMap.has(s))
-  const heavy = await Promise.all(
-    syms.map((s) => symbolStats(s).catch(() => null))
-  )
+  const heavy = await Promise.all(syms.map((s) => symbolStats(s).catch(() => null)))
   const pairs: Record<string, any> = {}
   syms.forEach((sym, i) => {
     const t = tickMap.get(sym)
     if (!t) return
     pairs[sym] = buildPair(sym, t, premMap.get(sym), heavy[i])
   })
+  return pairs
+}
 
+// The bulk layer (fast) gates the HTTP response. The heavy pairs layer refreshes
+// in the background and is merged in once ready, so the first call returns all
+// tickers quickly instead of blocking on per-symbol positioning calls.
+let bulk: { ts: number; tickers: Record<string, any>; tickMap: Map<string, any> | null; premMap: Map<string, any> | null } = { ts: 0, tickers: {}, tickMap: null, premMap: null }
+let bulkInflight: Promise<any> | null = null
+let pairsCache: { ts: number; pairs: Record<string, any> } = { ts: 0, pairs: {} }
+let pairsInflight: Promise<any> | null = null
+
+export async function getMarket(): Promise<any> {
+  const now = Date.now()
+
+  // 1. Refresh the bulk layer if stale. The response waits ONLY for this.
+  if (!bulk.tickMap || now - bulk.ts > CACHE_MS) {
+    if (!bulkInflight) {
+      bulkInflight = buildBulk()
+        .then((b) => {
+          bulk = { ts: Date.now(), tickers: b.tickers, tickMap: b.tickMap, premMap: b.premMap }
+          bulkInflight = null
+          return b
+        })
+        .catch((e) => {
+          bulkInflight = null
+          throw e
+        })
+    }
+    try {
+      await bulkInflight
+    } catch (e: any) {
+      if (!bulk.tickMap) {
+        return { available: false, reason: e?.message || 'binance_unreachable', source: 'binance-futures' }
+      }
+    }
+  }
+
+  // 2. Refresh the heavy pairs layer in the BACKGROUND (never blocks the response).
+  if (bulk.tickMap && now - pairsCache.ts > CACHE_MS && !pairsInflight) {
+    pairsInflight = buildPairs(bulk.tickMap, bulk.premMap as Map<string, any>)
+      .then((pp) => {
+        pairsCache = { ts: Date.now(), pairs: pp }
+        pairsInflight = null
+      })
+      .catch(() => {
+        pairsInflight = null
+      })
+  }
+
+  // 3. Return immediately: all tickers now, plus whatever pairs are ready so far.
   return {
     available: true,
     source: 'binance-futures',
     liveLiquidations: liqActive(),
     marketLiq: getMarketLiq(),
     ts: Date.now(),
-    pairs,
-    tickers,
+    pairs: pairsCache.pairs,
+    tickers: bulk.tickers,
   }
-}
-
-let cache: { ts: number; data: any } = { ts: 0, data: null }
-let inflight: Promise<any> | null = null
-
-export async function getMarket(): Promise<any> {
-  const now = Date.now()
-  if (cache.data && now - cache.ts < CACHE_MS) return cache.data
-  if (inflight) return inflight
-  inflight = build()
-    .then((d) => {
-      cache = { ts: Date.now(), data: d }
-      inflight = null
-      return d
-    })
-    .catch((e) => {
-      inflight = null
-      if (cache.data) return cache.data
-      return { available: false, reason: e?.message || 'binance_unreachable', source: 'binance-futures' }
-    })
-  return inflight
 }

@@ -45,7 +45,7 @@ export async function computeResonance() {
     const rows = await Promise.all(
       SYMBOLS.map(async (s) => {
         const r = await fetch(
-          'https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=' + s
+          (process.env.BINANCE_FAPI_BASE || 'https://fapi.binance.com').replace(/\/+$/, '') + '/fapi/v1/ticker/24hr?symbol=' + s
         )
         if (!r.ok) throw new Error('binance ' + r.status)
         const d: any = await r.json()

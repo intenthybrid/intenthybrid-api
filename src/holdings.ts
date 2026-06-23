@@ -7,6 +7,7 @@
 
 const ALCHEMY_KEY = process.env.ALCHEMY_API_KEY || ''
 const CALL_TIMEOUT_MS = Number(process.env.ALCHEMY_TIMEOUT_MS || 6000)
+const HOLD_CACHE_MS = Number(process.env.HOLDINGS_CACHE_MS || 45000)
 
 type ChainCfg = { id: string; label: string; base: string; native: string }
 
@@ -50,14 +51,19 @@ type Token = { chain: string; label: string; contract: string; symbol: string; n
 async function chainHoldings(c: ChainCfg, address: string): Promise<{ native: Native; tokens: Token[] }> {
   const native: Native = { chain: c.id, label: c.label, symbol: c.native, balance: null }
   let tokens: Token[] = []
+  // Native balance and token balances run in parallel (one round trip, not two).
+  const [weiR, balR] = await Promise.allSettled([
+    rpc(c.base, 'eth_getBalance', [address, 'latest']),
+    rpc(c.base, 'alchemy_getTokenBalances', [address]),
+  ])
   try {
-    const wei = await rpc(c.base, 'eth_getBalance', [address, 'latest'])
+    const wei = weiR.status === 'fulfilled' ? weiR.value : null
     if (wei) native.balance = Number(BigInt(wei)) / 1e18
   } catch {
     /* keep null */
   }
   try {
-    const res = await rpc(c.base, 'alchemy_getTokenBalances', [address])
+    const res = balR.status === 'fulfilled' ? balR.value : null
     const bals = ((res && res.tokenBalances) || [])
       .filter((b: any) => {
         try {
@@ -108,10 +114,15 @@ export type Holdings = {
   chains?: string[]
 }
 
+const holdCache = new Map<string, { ts: number; data: Holdings }>()
+
 export async function getHoldings(addressRaw: string): Promise<Holdings> {
   if (!ALCHEMY_KEY) return { error: 'alchemy_not_configured' }
   const address = String(addressRaw || '').trim()
   if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return { error: 'invalid_address' }
+  const key = address.toLowerCase()
+  const hit = holdCache.get(key)
+  if (hit && Date.now() - hit.ts < HOLD_CACHE_MS) return hit.data
   const chains = selectedChains()
   const results = await Promise.all(
     chains.map((c) =>
@@ -123,5 +134,7 @@ export async function getHoldings(addressRaw: string): Promise<Holdings> {
   )
   const natives = results.map((r) => r.native)
   const tokens = results.flatMap((r) => r.tokens)
-  return { address, natives, tokens, chains: chains.map((c) => c.label) }
+  const out: Holdings = { address, natives, tokens, chains: chains.map((c) => c.label) }
+  holdCache.set(key, { ts: Date.now(), data: out })
+  return out
 }
