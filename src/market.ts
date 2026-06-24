@@ -20,6 +20,10 @@ import { liqActive, getLiq, getMarketLiq } from './liquidations'
 export const BASE = (process.env.BINANCE_FAPI_BASE || 'https://fapi.binance.com').replace(/\/+$/, '')
 const CACHE_MS = Number(process.env.MARKET_CACHE_MS || 20000)
 const CALL_TIMEOUT_MS = Number(process.env.ALCHEMY_TIMEOUT_MS || 6000)
+// Rolling positioning poller knobs (all optional via .env):
+const POS_POLL_GAP_MS = Number(process.env.POS_POLL_GAP_MS || 500)     // pacing between per-symbol positioning fetches (~500ms -> full board in ~5min)
+const POS_MAX_AGE_MS = Number(process.env.POS_MAX_AGE_MS || 1200000)   // drop positioning older than this (20 min) and fall back to the estimate
+let rateLimitedUntil = 0 // set when Binance returns 429/418; the poller backs off until then
 
 const DEFAULT_SUBSET = [
   'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT', 'XRPUSDT', 'DOGEUSDT',
@@ -48,7 +52,10 @@ export async function fetchJson(url: string): Promise<any> {
   const to = setTimeout(() => ctrl.abort(), CALL_TIMEOUT_MS)
   try {
     const r = await fetch(url, { signal: ctrl.signal, headers: { accept: 'application/json' } })
-    if (!r.ok) throw new Error('HTTP ' + r.status)
+    if (!r.ok) {
+      if (r.status === 429 || r.status === 418) rateLimitedUntil = Date.now() + 60000
+      throw new Error('HTTP ' + r.status)
+    }
     return await r.json()
   } finally {
     clearTimeout(to)
@@ -206,26 +213,84 @@ async function buildBulk(): Promise<{ tickers: Record<string, any>; tickMap: Map
   return { tickers, tickMap, premMap }
 }
 
-// ---- Heavy layer: positioning/flow/OI for the focused subset. Slower (per-symbol). ----
-async function buildPairs(tickMap: Map<string, any>, premMap: Map<string, any>): Promise<Record<string, any>> {
-  const syms = subset().filter((s) => tickMap.has(s))
-  const heavy = await Promise.all(syms.map((s) => symbolStats(s).catch(() => null)))
-  const pairs: Record<string, any> = {}
-  syms.forEach((sym, i) => {
-    const t = tickMap.get(sym)
-    if (!t) return
-    pairs[sym] = buildPair(sym, t, premMap.get(sym), heavy[i])
-  })
-  return pairs
-}
+// ---- Heavy layer is now a rolling background poller (see below getMarket). ----
 
-// The bulk layer (fast) gates the HTTP response. The heavy pairs layer refreshes
-// in the background and is merged in once ready, so the first call returns all
-// tickers quickly instead of blocking on per-symbol positioning calls.
+// The bulk layer (price/change/volume/funding for EVERY pair) gates the HTTP
+// response. A background round-robin poller fetches REAL positioning / order-flow
+// / OI for ONE symbol at a time, cycling through every USDT perp, so over one
+// cycle (~5 min) the whole board has real data. The /futures/data endpoints are
+// weight 0 with a 1000-req/5min/IP cap, and one cycle is ~645 calls/endpoint, so
+// this stays comfortably under the limit on a single IP.
 let bulk: { ts: number; tickers: Record<string, any>; tickMap: Map<string, any> | null; premMap: Map<string, any> | null } = { ts: 0, tickers: {}, tickMap: null, premMap: null }
 let bulkInflight: Promise<any> | null = null
-let pairsCache: { ts: number; pairs: Record<string, any> } = { ts: 0, pairs: {} }
-let pairsInflight: Promise<any> | null = null
+
+// Rolling positioning cache: latest REAL positioning per symbol (never fabricated).
+const posCache = new Map<string, { ss: any; ts: number }>()
+let symList: string[] = []
+let cursor = 0
+let pollStarted = false
+let pollTimer: any = null
+
+// Rotation order: priority subset (env MARKET_SYMBOLS or defaults) first so the
+// most-watched pairs get real data within seconds, then every other USDT perp.
+function buildSymList(tm: Map<string, any>): string[] {
+  const all = Array.from(tm.keys()).filter((sym) => sym.endsWith('USDT'))
+  const pri = subset().filter((sym) => tm.has(sym))
+  const priSet = new Set(pri)
+  return pri.concat(all.filter((sym) => !priSet.has(sym)))
+}
+
+function schedulePoll(ms: number): void {
+  if (pollTimer) clearTimeout(pollTimer)
+  pollTimer = setTimeout(runPollStep, ms)
+}
+
+// One step: fetch positioning for the next symbol, store if real, then schedule next.
+async function runPollStep(): Promise<void> {
+  try {
+    if (Date.now() < rateLimitedUntil) { schedulePoll(Math.max(2000, rateLimitedUntil - Date.now())); return }
+    const tm = bulk.tickMap
+    if (!tm) { schedulePoll(1500); return }
+    if (cursor >= symList.length) {
+      symList = buildSymList(tm)
+      cursor = 0
+      if (!symList.length) { schedulePoll(3000); return }
+    }
+    const sym = symList[cursor++]
+    if (sym && tm.has(sym)) {
+      try {
+        const ss = await symbolStats(sym)
+        // Store only when Binance actually returned positioning. Symbols with no
+        // long/short or taker data are left to the bulk estimate (never faked).
+        if (ss && (isFinite(ss.longAccount) || isFinite(ss.taker))) posCache.set(sym, { ss, ts: Date.now() })
+      } catch (e) { /* single-symbol error: skip, keep rotating */ }
+    }
+  } catch (e) { /* never let the loop die */ }
+  schedulePoll(POS_POLL_GAP_MS)
+}
+
+function startPoller(): void {
+  if (pollStarted) return
+  pollStarted = true
+  schedulePoll(0)
+}
+
+// Build the dApp pair objects fresh each call from the rolling positioning cache.
+// Only pairs with fresh, real positioning are included; the rest fall through to
+// the bulk ticker estimate on the client.
+function assemblePairs(): Record<string, any> {
+  const out: Record<string, any> = {}
+  const tm = bulk.tickMap
+  if (!tm) return out
+  const now = Date.now()
+  for (const [sym, ent] of posCache) {
+    if (now - ent.ts > POS_MAX_AGE_MS) continue
+    const t = tm.get(sym)
+    if (!t) continue
+    out[sym] = buildPair(sym, t, bulk.premMap ? bulk.premMap.get(sym) : null, ent.ss)
+  }
+  return out
+}
 
 export async function getMarket(): Promise<any> {
   const now = Date.now()
@@ -253,26 +318,18 @@ export async function getMarket(): Promise<any> {
     }
   }
 
-  // 2. Refresh the heavy pairs layer in the BACKGROUND (never blocks the response).
-  if (bulk.tickMap && now - pairsCache.ts > CACHE_MS && !pairsInflight) {
-    pairsInflight = buildPairs(bulk.tickMap, bulk.premMap as Map<string, any>)
-      .then((pp) => {
-        pairsCache = { ts: Date.now(), pairs: pp }
-        pairsInflight = null
-      })
-      .catch(() => {
-        pairsInflight = null
-      })
-  }
+  // 2. Kick off the rolling positioning poller once bulk data exists (runs forever).
+  if (bulk.tickMap) startPoller()
 
-  // 3. Return immediately: all tickers now, plus whatever pairs are ready so far.
+  // 3. Return immediately: all tickers, plus every pair that has real positioning so far.
   return {
     available: true,
     source: 'binance-futures',
     liveLiquidations: liqActive(),
     marketLiq: getMarketLiq(),
     ts: Date.now(),
-    pairs: pairsCache.pairs,
+    pairs: assemblePairs(),
     tickers: bulk.tickers,
+    posCount: posCache.size,
   }
 }
